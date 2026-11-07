@@ -23,7 +23,11 @@ def refresh_yoco_weight_cache(
         or cached.device != value.device
     ):
         raise ValueError("Incompatible YOCO weight cache on weight reload")
-    cached.copy_(value)
+    # With dummy loading, the first forward (profile run, under inference_mode)
+    # creates the cache, so it is an inference tensor; RL refit then reloads
+    # outside inference_mode. Write through .data (as Worker.wake_up does for
+    # saved buffers) to update the same storage in either mode.
+    cached.data.copy_(value)
     return cached
 
 

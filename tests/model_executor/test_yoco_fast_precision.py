@@ -104,6 +104,81 @@ def test_cache_refresh_preserves_storage_and_rejects_graph_incompatible_change()
     assert torch.equal(cache, new)
 
 
+def _yoco_moe_router_stub(normalized: bool):
+    from vllm.model_executor.layers.yoco_moe import YOCOMoE
+
+    module = YOCOMoE.__new__(YOCOMoE)
+    torch.nn.Module.__init__(module)
+    module.execution_mode = "fast"
+    module.router_weights_normalized = normalized
+    module.bf16_router = True
+    module.register_buffer("_normalized_gate_weight", None, persistent=False)
+    module.register_buffer("_bf16_gate_weight", None, persistent=False)
+    module.gate = torch.nn.Linear(8, 4, bias=False)
+    return module
+
+
+@pytest.mark.parametrize("refresh_in_inference_mode", [False, True])
+@pytest.mark.parametrize("normalized", [False, True])
+def test_derived_caches_created_in_inference_mode_refresh_in_place(
+    normalized, refresh_in_inference_mode
+):
+    """Dummy load + RL refit: the caches are first built by the profile run under
+    inference_mode, then refreshed by load_weights outside it (S2 run4 error)."""
+    from vllm.model_executor.layers.yoco_fast import refresh_yoco_module_cache
+
+    router = _yoco_moe_router_stub(normalized)
+    shared = torch.nn.Module()
+    shared.register_buffer("_fast_down_weight_t", None, persistent=False)
+    shared.down_proj = torch.nn.Linear(4, 6, bias=False)
+
+    def refresh_all():
+        router.initialize_router_weight_cache()
+        # Same call as YOCOSharedExperts.initialize_fast_weight_cache (CUDA-only).
+        shared._fast_down_weight_t = refresh_yoco_module_cache(
+            shared, "_fast_down_weight_t", shared.down_proj.weight.t().contiguous()
+        )
+
+    with torch.inference_mode():
+        refresh_all()
+    caches = {
+        "_bf16_gate_weight": router._bf16_gate_weight,
+        "_fast_down_weight_t": shared._fast_down_weight_t,
+    }
+    if not normalized:
+        caches["_normalized_gate_weight"] = router._normalized_gate_weight
+    else:
+        assert router._normalized_gate_weight is None
+    assert all(cache.is_inference() for cache in caches.values())
+    addresses = {name: cache.data_ptr() for name, cache in caches.items()}
+
+    with torch.no_grad():
+        router.gate.weight.copy_(torch.randn_like(router.gate.weight))
+        shared.down_proj.weight.copy_(torch.randn_like(shared.down_proj.weight))
+    if refresh_in_inference_mode:
+        with torch.inference_mode():
+            refresh_all()
+    else:
+        refresh_all()
+
+    current = {
+        "_bf16_gate_weight": router._bf16_gate_weight,
+        "_fast_down_weight_t": shared._fast_down_weight_t,
+        "_normalized_gate_weight": router._normalized_gate_weight,
+    }
+    for name, cache in caches.items():
+        assert current[name] is cache
+        assert cache.data_ptr() == addresses[name]
+    gate = router.gate.weight.detach()
+    if not normalized:
+        gate = gate / gate.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        assert torch.equal(caches["_normalized_gate_weight"], gate)
+    assert torch.equal(caches["_bf16_gate_weight"], gate.to(torch.bfloat16))
+    assert torch.equal(
+        caches["_fast_down_weight_t"], shared.down_proj.weight.detach().t()
+    )
+
+
 @pytest.mark.parametrize("reload_stage", ["none", "before_cache", "after_cache"])
 def test_router_cache_refresh_uses_the_shared_storage_contract(reload_stage):
     from vllm.model_executor.layers.yoco_moe import YOCOMoE
