@@ -315,6 +315,12 @@ class ServingTokens(GenerateBaseServing):
                 else None
             )
 
+            routed_experts_present_b64 = (
+                numpy2base64(output.routed_experts_present)
+                if output.routed_experts_present is not None
+                else None
+            )
+
             sampling_mask = None
             if output.sampling_mask is not None:
                 sampling_mask = output.sampling_mask.token_ids
@@ -325,6 +331,7 @@ class ServingTokens(GenerateBaseServing):
                 finish_reason=output.finish_reason if output.finish_reason else "stop",
                 token_ids=as_list(output.token_ids),
                 routed_experts=routed_experts_b64,
+                routed_experts_present=routed_experts_present_b64,
                 sampling_mask=sampling_mask,
             )
 
@@ -441,6 +448,12 @@ class ServingTokens(GenerateBaseServing):
                         else None
                     )
 
+                    routed_experts_present_b64 = (
+                        numpy2base64(output.routed_experts_present)
+                        if output.routed_experts_present is not None
+                        else None
+                    )
+
                     chunk = GenerateStreamResponse(
                         request_id=request_id,
                         choices=[
@@ -450,6 +463,7 @@ class ServingTokens(GenerateBaseServing):
                                 finish_reason=finish_reason,
                                 token_ids=as_list(delta_token_ids),
                                 routed_experts=routed_experts_b64,
+                                routed_experts_present=routed_experts_present_b64,
                             )
                         ],
                     )

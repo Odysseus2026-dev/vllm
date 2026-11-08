@@ -324,6 +324,11 @@ class GenerateResponseChoice(BaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
+    # YOCO logical-use layout only: base64 ``.npy`` bool
+    # (rows, num_uses), row-aligned with ``routed_experts``.
+    routed_experts_present: str | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     sampling_mask: list[list[int]] | None = None
 
     @field_validator("token_ids")
@@ -340,6 +345,11 @@ class GenerateResponseStreamChoice(BaseModel):
     finish_reason: str | None = None
     token_ids: list[int] | None = None
     routed_experts: str | None = None
+    # YOCO logical-use layout only: base64 ``.npy`` bool
+    # (rows, num_uses), row-aligned with ``routed_experts``.
+    routed_experts_present: str | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     sampling_mask: list[list[int]] | None = None
 
 

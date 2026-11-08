@@ -3847,6 +3847,7 @@ class GPUModelRunner(
                     self.routed_experts_slot_mapping_device[:total],
                     non_blocking=True,
                 )
+                self.routed_experts_capturer.reset_after_snapshot()
             with gpu_sync_allowed():
                 # Get the valid generated tokens.
                 max_gen_len = sampled_token_ids.shape[-1]
@@ -7663,10 +7664,12 @@ class GPUModelRunner(
             return None
 
         device_buffer = self.routed_experts_capturer.get_device_buffer()
-        return RoutedExpertsTensors(
+        snapshot = RoutedExpertsTensors(
             routing_data=device_buffer[:num_tokens].clone(),
             slot_mapping=self.routed_experts_slot_mapping_device[:num_tokens].clone(),
         )
+        self.routed_experts_capturer.reset_after_snapshot()
+        return snapshot
 
     def init_routed_experts_capturer(self):
         logger.info(

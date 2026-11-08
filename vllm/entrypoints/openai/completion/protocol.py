@@ -653,6 +653,11 @@ class CompletionResponseChoice(OpenAIBaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
+    # YOCO logical-use layout only: base64 ``.npy`` bool
+    # (rows, num_uses), row-aligned with ``routed_experts``.
+    routed_experts_present: str | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
 
 class CompletionResponse(OpenAIBaseModel):

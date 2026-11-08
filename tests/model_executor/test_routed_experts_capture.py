@@ -4,6 +4,7 @@ import types
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -99,8 +100,8 @@ def _make_model_config(hf_config):
         ),
     )
     model_config.get_num_experts = lambda: hf_config.num_experts
-    model_config.get_num_experts_per_tok = lambda: (
-        ModelConfig.get_num_experts_per_tok(model_config)
+    model_config.get_num_experts_per_tok = lambda: ModelConfig.get_num_experts_per_tok(
+        model_config
     )
     model_config.get_total_num_hidden_layers = lambda: hf_config.num_hidden_layers
     return model_config
@@ -470,3 +471,247 @@ def test_v2_model_runner_accepts_routed_experts(monkeypatch):
     unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
 
     assert "routed experts capture" not in unsupported
+
+
+# --------------------------------------------------------------------------- #
+# YOCO logical-use capture (one routed-experts slot per universal-loop use).  #
+# --------------------------------------------------------------------------- #
+
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (  # noqa: E402
+    RoutedExpertsUseLayout,
+    _check_use_layout_supported,
+    get_routed_experts_use_layout,
+)
+
+
+def _agens_layer_id(use: int, num_self: int, loops: int) -> int:
+    # Agens megatron/core/models/yoco/config.py YOCOPlacement.layer_id.
+    self_uses = num_self * loops
+    return use % num_self if use < self_uses else use - self_uses + num_self
+
+
+def _rl_bridge_slot(layer: int, loop: int, num_self: int, loops: int) -> int:
+    # rl-bridge models/agens_v3/patches/vllm-yoco-routing-replay.patch.
+    if layer < num_self:
+        return loop * num_self + layer
+    return loops * num_self + layer - num_self
+
+
+def _execution_order(layout: RoutedExpertsUseLayout) -> list[tuple[int, int]]:
+    order = [
+        (layer, loop)
+        for loop in range(layout.universal_loop)
+        for layer in range(layout.num_self_layers)
+    ]
+    order += [(layer, 0) for layer in range(layout.num_self_layers, layout.num_layers)]
+    return [(layer, loop) for layer, loop in order if layer >= layout.dense_layers]
+
+
+@pytest.mark.parametrize(
+    "num_self,num_cross,loops", [(10, 10, 3), (4, 4, 3), (2, 3, 1)]
+)
+def test_yoco_use_layout_matches_agens_and_rl_bridge(num_self, num_cross, loops):
+    layout = RoutedExpertsUseLayout(num_self + num_cross, num_self, loops)
+    assert layout.num_uses == num_self * loops + num_cross
+    uses = []
+    for layer, loop in _execution_order(layout):
+        use = layout.use_index(layer, loop)
+        assert use == _rl_bridge_slot(layer, loop, num_self, loops)
+        assert _agens_layer_id(use, num_self, loops) == layer
+        assert layout.layer_of_use(use) == (layer, loop)
+        uses.append(use)
+    # Execution order is use order, every use exactly once.
+    assert uses == list(range(layout.num_uses))
+
+
+def test_yoco_use_layout_only_for_yoco():
+    yoco = SimpleNamespace(
+        model_type="yoco",
+        num_hidden_layers=20,
+        yoco_cross_layers=10,
+        universal_loop=3,
+        dense_layers=0,
+    )
+    vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=yoco))
+    assert get_routed_experts_use_layout(vllm_config) == RoutedExpertsUseLayout(
+        20, 10, 3, 0
+    )
+    other = SimpleNamespace(model_type="qwen3_moe", num_hidden_layers=20)
+    vllm_config.model_config.hf_text_config = other
+    assert get_routed_experts_use_layout(vllm_config) is None
+
+
+def test_yoco_capture_refuses_fast_prefill_and_dbo():
+    cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(kv_sharing_fast_prefill=True),
+        parallel_config=SimpleNamespace(enable_dbo=False),
+    )
+    with pytest.raises(ValueError, match="kv_sharing_fast_prefill"):
+        _check_use_layout_supported(cfg)
+    cfg.cache_config.kv_sharing_fast_prefill = False
+    cfg.parallel_config.enable_dbo = True
+    with pytest.raises(ValueError, match="dual-batch"):
+        _check_use_layout_supported(cfg)
+
+
+def _yoco_capturer(layout: RoutedExpertsUseLayout, *, tokens=5, top_k=2):
+    c = _capturer_with_buffer(
+        max_tokens=tokens, num_layers=layout.num_uses, num_experts_per_tok=top_k
+    )
+    c.use_layout = layout
+    c._use_ctx = None
+    c._use_counts = None
+    return c
+
+
+def _per_use_routes(layout, tokens, top_k, seed):
+    g = torch.Generator().manual_seed(seed)
+    return [
+        torch.randint(0, 128, (tokens, top_k), generator=g, dtype=torch.int64)
+        for _ in range(layout.num_uses)
+    ]
+
+
+def _fake_forward(capturer, routes, *, stop_after=None):
+    """Call capture in YOCO launch order under one fresh ForwardContext."""
+    ctx = SimpleNamespace(dp_metadata=None)
+    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+        for i, (layer, loop) in enumerate(_execution_order(capturer.use_layout)):
+            if stop_after is not None and i == stop_after:
+                return
+            capturer.capture(layer, routes[capturer.use_layout.use_index(layer, loop)])
+
+
+def test_yoco_capture_writes_each_loop_to_its_own_use():
+    layout = RoutedExpertsUseLayout(5, 3, 3)
+    c = _yoco_capturer(layout)
+    for seed in (0, 1):  # second forward = new context, counters restart
+        routes = _per_use_routes(layout, 5, 2, seed)
+        _fake_forward(c, routes)
+        for use in range(layout.num_uses):
+            assert torch.equal(c.device_buffer[:, use, :], routes[use].int())
+        # The three loops of one self layer land in three different slots.
+        assert len({layout.use_index(0, k) for k in range(3)}) == 3
+        c.check_use_counts_complete()
+
+
+def test_yoco_capture_rejects_extra_and_missing_uses():
+    layout = RoutedExpertsUseLayout(5, 3, 3)
+    routes = _per_use_routes(layout, 5, 2, 0)
+    c = _yoco_capturer(layout)
+    ctx = SimpleNamespace(dp_metadata=None)
+    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+        for _ in range(3):
+            c.capture(0, routes[0])
+        with pytest.raises(IndexError, match="routed uses per forward"):
+            c.capture(0, routes[0])
+        with pytest.raises(IndexError):
+            c.capture(4, routes[0])
+            c.capture(4, routes[0])
+
+    c = _yoco_capturer(layout)
+    _fake_forward(c, routes, stop_after=7)
+    with pytest.raises(AssertionError, match="incomplete YOCO forward"):
+        c.reset_after_snapshot()
+    with pytest.raises(AssertionError, match="incomplete YOCO forward"):
+        _fake_forward(c, routes)
+
+
+def test_yoco_reset_after_snapshot_rearms_absent_sentinel():
+    layout = RoutedExpertsUseLayout(5, 3, 3)
+    c = _yoco_capturer(layout)
+    _fake_forward(c, _per_use_routes(layout, 5, 2, 0))
+    c.reset_after_snapshot()
+    assert bool((c.device_buffer == -1).all())
+
+
+def _yoco_manager(layout, num_experts=128, top_k=2, num_blocks=2, block_size=4):
+    hf_config = SimpleNamespace(
+        model_type="yoco",
+        num_hidden_layers=layout.num_layers,
+        yoco_cross_layers=layout.num_cross_layers,
+        universal_loop=layout.universal_loop,
+        dense_layers=layout.dense_layers,
+        num_experts=num_experts,
+        num_experts_per_tok=top_k,
+    )
+    vllm_config = SimpleNamespace(model_config=_make_model_config(hf_config))
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    kv = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
+    )
+    return RoutedExpertsManager(vllm_config, kv)
+
+
+def test_yoco_manager_stores_present_mask_and_zeroes_absent_rows():
+    layout = RoutedExpertsUseLayout(5, 3, 3)
+    m = _yoco_manager(layout)
+    assert m.routed_experts_by_slot.shape == (8, layout.num_uses, 2)
+    data = (
+        np.arange(3 * layout.num_uses * 2, dtype=np.int32).reshape(
+            3, layout.num_uses, 2
+        )
+        % 128
+    )
+    data[1, 4] = -1  # use 4 not captured for the second token
+    m.store_batch(data, np.array([5, 6, 7]))
+    routes = m.get([0, 1], 8, token_start=5)
+    present = m.get_present([0, 1], 8, token_start=5)
+    assert present.shape == (3, layout.num_uses)
+    assert not present[1, 4] and present.sum() == 3 * layout.num_uses - 1
+    assert (routes[1, 4] == 0).all()
+    expected = data.copy()
+    expected[1, 4] = 0
+    assert np.array_equal(routes, expected)
+    with pytest.raises(AssertionError, match="partially"):
+        bad = data.copy()
+        bad[0, 0, 0] = -1
+        m.present_rows(bad)
+
+
+def test_non_yoco_manager_has_no_present_mask():
+    hf_config = SimpleNamespace(
+        num_experts=8, num_experts_per_tok=2, num_hidden_layers=3
+    )
+    vllm_config = SimpleNamespace(model_config=_make_model_config(hf_config))
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    kv = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["l"], spec)],
+    )
+    m = RoutedExpertsManager(vllm_config, kv)
+    assert m.present_by_slot is None and m.get_present([0], 3) is None
+
+
+def test_yoco_binding_requires_opaque_moe_op_when_compiled(monkeypatch):
+    class DummyFusedMoE:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+            self.layer_name = f"model.layers.{layer_id}.mlp.experts"
+            self.router = _make_router()
+            self._quant_method = _make_modular_routed_experts().quant_method
+            self._forward_entry = lambda *a: None  # traced, not opaque
+
+    import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
+
+    monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyFusedMoE)
+    layout = RoutedExpertsUseLayout(3, 2, 3)
+    modules = [DummyFusedMoE(i) for i in range(3)]
+    model = SimpleNamespace(modules=lambda: modules)
+    capturer = SimpleNamespace(
+        capture=lambda *a: None, use_layout=layout, compiled=True
+    )
+    with pytest.raises(ValueError, match="opaque"):
+        bind_routed_experts_capturer(model, capturer)
+    capturer.compiled = False
+    bind_routed_experts_capturer(model, capturer)
+    model = SimpleNamespace(modules=lambda: modules[:2])
+    with pytest.raises(ValueError, match="expected"):
+        bind_routed_experts_capturer(model, capturer)

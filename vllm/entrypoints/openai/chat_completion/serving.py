@@ -1116,6 +1116,12 @@ class OpenAIServingChat(GenerateBaseServing):
                 else None
             )
 
+            routed_experts_present_b64 = (
+                numpy2base64(output.routed_experts_present)
+                if output.routed_experts_present is not None
+                else None
+            )
+
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=message,
@@ -1132,6 +1138,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     else None
                 ),
                 routed_experts=routed_experts_b64,
+                routed_experts_present=routed_experts_present_b64,
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 

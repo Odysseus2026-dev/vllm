@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
+
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -1974,10 +1976,14 @@ class Scheduler(SchedulerInterface):
         # requests may terminate on tokens generated in this very step,
         # whose routing was just D2H'd into model_runner_output.
         routing_data = None
+        routing_present = None
         routing_offsets: dict[str, int] = {}
         if model_runner_output.routed_experts is not None:
             re = model_runner_output.routed_experts
             self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
+            if self.routed_experts_mgr.present_by_slot is not None:
+                # Before narrowing: -1 is the "not captured" sentinel.
+                routing_present = self.routed_experts_mgr.present_rows(re.routing_data)
             routing_data = re.routing_data.astype(
                 self.routed_experts_mgr.routed_experts_by_slot.dtype,
                 copy=False,
@@ -2133,6 +2139,7 @@ class Scheduler(SchedulerInterface):
                     stopped = True
 
             routed_experts = None
+            routed_experts_present = None
             if (
                 self.enable_return_routed_experts
                 and routing_data is not None
@@ -2161,16 +2168,27 @@ class Scheduler(SchedulerInterface):
                         request.num_prompt_tokens,
                         token_start=prompt_start,
                     )
+                    routed_experts_present = self.routed_experts_mgr.get_present(
+                        block_ids,
+                        request.num_prompt_tokens,
+                        token_start=prompt_start,
+                    )
                 else:
                     if scheduled_spec_token_ids:
                         # Spec decode: accepted tokens at the START of
                         # the scheduled range, rejected at the end.
-                        routed_experts = routing_data[
-                            req_offset : req_offset + len(new_token_ids)
-                        ]
+                        rows = slice(req_offset, req_offset + len(new_token_ids))
                     else:
                         # Normal decode / re-prefill: token(s) at the END.
-                        routed_experts = routing_data[end - len(new_token_ids) : end]
+                        rows = slice(end - len(new_token_ids), end)
+                    routed_experts = routing_data[rows]
+                    if routing_present is not None:
+                        routed_experts_present = routing_present[rows]
+                        # Absent rows hold the -1 sentinel; report them as 0
+                        # like the slot buffer does.
+                        routed_experts = np.where(
+                            routed_experts_present[..., None], routed_experts, 0
+                        ).astype(routing_data.dtype, copy=False)
 
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
@@ -2239,6 +2257,7 @@ class Scheduler(SchedulerInterface):
                         ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
+                        routed_experts_present=routed_experts_present,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )

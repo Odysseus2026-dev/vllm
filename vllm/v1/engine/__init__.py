@@ -233,6 +233,10 @@ class EngineCoreOutput(
     # Appended last so `array_like` positional serialization stays compatible.
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
+    # (rows, num_uses) bool presence for ``routed_experts`` rows; only for
+    # the logical-use (YOCO) layout. Appended last for ``array_like``.
+    routed_experts_present: np.ndarray | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

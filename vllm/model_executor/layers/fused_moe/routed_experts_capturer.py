@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 from typing import Protocol, runtime_checkable
 
@@ -29,9 +30,120 @@ class RoutedExpertsCaptureSource(Protocol):
     capture_fn: Callable[[torch.Tensor], None] | None
 
 
+@dataclass(frozen=True)
+class RoutedExpertsUseLayout:
+    """Logical-use layout of routed-experts rows for models that execute the
+    same MoE layer more than once per forward (YOCO's ``universal_loop``).
+
+    Second dimension of the routed-experts buffers is the *logical use*, the
+    same ordering as Agens ``YOCOPlacement`` and rl-bridge's
+    ``vllm-yoco-routing-replay.patch``:
+
+    * self layer ``l`` (``l < num_self_layers``) on loop ``k``:
+      ``use = k * num_self_layers + l``;
+    * cross layer ``l`` (``l >= num_self_layers``), executed once:
+      ``use = universal_loop * num_self_layers + (l - num_self_layers)``.
+
+    Dense layers (``l < dense_layers``) keep their use slots but never route;
+    their rows are reported absent in ``routed_experts_present``.
+    """
+
+    num_layers: int
+    num_self_layers: int
+    universal_loop: int
+    dense_layers: int = 0
+
+    def __post_init__(self) -> None:
+        if not (
+            0 < self.num_self_layers <= self.num_layers
+            and self.universal_loop >= 1
+            and 0 <= self.dense_layers <= self.num_layers
+        ):
+            raise ValueError(f"Invalid routed-experts use layout: {self}")
+
+    @property
+    def num_cross_layers(self) -> int:
+        return self.num_layers - self.num_self_layers
+
+    @property
+    def num_uses(self) -> int:
+        return self.num_self_layers * self.universal_loop + self.num_cross_layers
+
+    def calls_per_forward(self, layer_id: int) -> int:
+        """Routed MoE executions of ``layer_id`` in one full forward."""
+        self._check_layer(layer_id)
+        if layer_id < self.dense_layers:
+            return 0
+        return self.universal_loop if layer_id < self.num_self_layers else 1
+
+    def use_index(self, layer_id: int, loop_idx: int) -> int:
+        calls = self.calls_per_forward(layer_id)
+        if not 0 <= loop_idx < calls:
+            raise IndexError(
+                f"routed-experts layer {layer_id} has {calls} routed uses per "
+                f"forward; got use {loop_idx}"
+            )
+        if layer_id < self.num_self_layers:
+            return loop_idx * self.num_self_layers + layer_id
+        return (
+            self.universal_loop * self.num_self_layers + layer_id - self.num_self_layers
+        )
+
+    def layer_of_use(self, use: int) -> tuple[int, int]:
+        """Inverse map: ``use -> (layer_id, loop_idx)``."""
+        if not 0 <= use < self.num_uses:
+            raise IndexError(f"routed-experts use {use} outside [0, {self.num_uses})")
+        self_uses = self.num_self_layers * self.universal_loop
+        if use < self_uses:
+            return use % self.num_self_layers, use // self.num_self_layers
+        return use - self_uses + self.num_self_layers, 0
+
+    def _check_layer(self, layer_id: int) -> None:
+        if not 0 <= layer_id < self.num_layers:
+            raise IndexError(
+                f"routed-experts layer {layer_id} outside [0, {self.num_layers})"
+            )
+
+
+def _cfg_first_int(config, *names: str, default: int | None = None) -> int:
+    for name in names:
+        value = getattr(config, name, None)
+        if value is not None:
+            return int(value)
+    if default is None:
+        raise ValueError(f"config has none of {names}")
+    return default
+
+
+def get_routed_experts_use_layout(
+    vllm_config: VllmConfig,
+) -> RoutedExpertsUseLayout | None:
+    """Return the logical-use layout for YOCO, ``None`` for every other model.
+
+    ``None`` keeps the historical per-layer layout bit-for-bit.
+    """
+    model_config = vllm_config.model_config
+    hf_config = model_config.hf_text_config
+    if getattr(hf_config, "model_type", None) != "yoco":
+        return None
+    num_layers = _cfg_first_int(hf_config, "num_hidden_layers", "n_layers")
+    cross = _cfg_first_int(hf_config, "yoco_cross_layers", default=0)
+    return RoutedExpertsUseLayout(
+        num_layers=num_layers,
+        num_self_layers=num_layers - cross,
+        universal_loop=_cfg_first_int(hf_config, "universal_loop", default=1),
+        dense_layers=_cfg_first_int(hf_config, "dense_layers", default=0),
+    )
+
+
 def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
     model_config = vllm_config.model_config
-    num_layers = model_config.get_total_num_hidden_layers()
+    layout = get_routed_experts_use_layout(vllm_config)
+    num_layers = (
+        layout.num_uses
+        if layout is not None
+        else model_config.get_total_num_hidden_layers()
+    )
     num_experts = model_config.get_num_experts()
     num_experts_per_tok = model_config.get_num_experts_per_tok()
     if num_layers <= 0 or num_experts <= 0 or num_experts_per_tok <= 0:
@@ -104,6 +216,76 @@ class RoutedExpertsCapturer:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         # KV cache group whose slot layout the routing data is keyed by.
         self.attn_gid = get_routed_experts_attn_gid(kv_cache_config)
+
+        # Logical-use layout (YOCO universal loop); None = per-layer layout.
+        self.use_layout = get_routed_experts_use_layout(vllm_config)
+        # Per-forward use counters. ``_use_ctx`` is the ForwardContext the
+        # counters belong to; holding a strong reference makes the identity
+        # test immune to id() reuse.
+        self._use_ctx: object | None = None
+        self._use_counts: list[int] | None = None
+        from vllm.config import CompilationMode
+
+        self.compiled = vllm_config.compilation_config.mode != CompilationMode.NONE
+        if self.use_layout is not None:
+            _check_use_layout_supported(vllm_config)
+            # -1 marks "not captured in this step" (present mask source).
+            self.device_buffer.fill_(-1)
+
+    def _next_use(self, layer_id: int) -> int:
+        """Map this MoE execution of ``layer_id`` to its logical use.
+
+        Runs as Python *inside* the opaque ``vllm.moe_forward`` custom op, so
+        it executes in launch order: eagerly on every eager step, and once
+        per call site while a CUDA graph is being captured (the resulting
+        buffer address is then frozen in the graph and replayed). The k-th
+        execution of a layer within one ForwardContext is loop ``k``.
+        """
+        layout = self.use_layout
+        assert layout is not None
+        ctx = get_forward_context()
+        if ctx is not self._use_ctx:
+            self.check_use_counts_complete()
+            self._use_ctx = ctx
+            self._use_counts = [0] * layout.num_layers
+        counts = self._use_counts
+        assert counts is not None
+        loop_idx = counts[layer_id]
+        use = layout.use_index(layer_id, loop_idx)  # raises past the last loop
+        counts[layer_id] = loop_idx + 1
+        return use
+
+    def check_use_counts_complete(self) -> None:
+        """Fail loudly if the last Python-executed forward skipped a use.
+
+        Idempotent; a CUDA-graph replay executes no Python and leaves the
+        (already validated) counters of the capturing forward untouched.
+        """
+        layout = getattr(self, "use_layout", None)
+        counts = getattr(self, "_use_counts", None)
+        if layout is None or counts is None:
+            return
+        missing = [
+            (layer, counts[layer], layout.calls_per_forward(layer))
+            for layer in range(layout.num_layers)
+            if counts[layer] != layout.calls_per_forward(layer)
+        ]
+        if missing:
+            raise AssertionError(
+                "RoutedExpertsCapturer: incomplete YOCO forward, "
+                "(layer, captured uses, expected uses) = " + repr(missing)
+            )
+
+    def reset_after_snapshot(self) -> None:
+        """Re-arm the absent sentinel once this step's rows are snapshotted.
+
+        Must be enqueued on the same stream after the D2H copy / clone of
+        ``device_buffer``. No-op for the per-layer layout.
+        """
+        if getattr(self, "use_layout", None) is None:
+            return
+        self.check_use_counts_complete()
+        self.device_buffer.fill_(-1)
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         """Capture expert routing decisions for a specific layer.
@@ -211,15 +393,15 @@ class RoutedExpertsCapturer:
                     f"dp_rank={self.dp_rank}, tp_size={self.tp_size})"
                 )
 
-        if layer_id >= self.device_buffer.shape[1]:
+        layout = getattr(self, "use_layout", None)
+        slot = layer_id if layout is None else self._next_use(layer_id)
+        if slot >= self.device_buffer.shape[1]:
             raise IndexError(
-                f"routed-experts layer {layer_id} exceeds capture buffer "
-                f"layer count {self.device_buffer.shape[1]}"
+                f"routed-experts layer {layer_id} (slot {slot}) exceeds capture "
+                f"buffer layer count {self.device_buffer.shape[1]}"
             )
 
-        self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
-            start_loc:end_loc, :
-        ]
+        self.device_buffer[:token_num_per_dp, slot, :] = topk_ids[start_loc:end_loc, :]
 
     def get_device_buffer(self) -> torch.Tensor:
         """Return the underlying device buffer so the model runner can
@@ -242,10 +424,37 @@ class RoutedExpertsCapturer:
                 shape ``(num_kv_cache_groups, max_num_batched_tokens)``.
             num_tokens: Total number of tokens scheduled in this step.
         """
-        return RoutedExpertsTensors(
+        snapshot = RoutedExpertsTensors(
             routing_data=self.device_buffer[:num_tokens].clone(),
             slot_mapping=slot_mappings[self.attn_gid, :num_tokens].clone(),
         )
+        self.reset_after_snapshot()
+        return snapshot
+
+
+def _check_use_layout_supported(vllm_config: VllmConfig) -> None:
+    """Configurations where per-use YOCO capture is known to be row-exact."""
+    if vllm_config.cache_config.kv_sharing_fast_prefill:
+        # Fast prefill runs the cross layers on compacted logits rows only, so
+        # cross-use rows would be written at compact (wrong) offsets. Decision
+        # S6-D4 / D149: R3 runs with fast prefill off.
+        raise ValueError(
+            "YOCO routed-experts capture (enable_return_routed_experts) "
+            "requires kv_sharing_fast_prefill=False (S6-D4)."
+        )
+    if vllm_config.parallel_config.enable_dbo:
+        raise ValueError(
+            "YOCO routed-experts capture does not support dual-batch overlap."
+        )
+
+
+def _moe_entry_is_opaque(module) -> bool:
+    entry = getattr(module, "_forward_entry", None)
+    ops = getattr(torch.ops, "vllm", None)
+    opaque = tuple(
+        getattr(ops, name, None) for name in ("moe_forward", "moe_forward_shared")
+    )
+    return entry is not None and any(entry is op for op in opaque if op is not None)
 
 
 def bind_routed_experts_capturer(
@@ -259,15 +468,33 @@ def bind_routed_experts_capturer(
     )
     from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
+    layout = getattr(capturer, "use_layout", None)
+    compiled = getattr(capturer, "compiled", True)
+    bound_layers: list[int] = []
     num_bound = 0
     for module in model.modules():
         if isinstance(module, RoutedExpertsCaptureSource):
+            if layout is not None:
+                raise ValueError(
+                    "Per-use routed-experts capture supports MoERunner layers only."
+                )
             module.capture_fn = partial(capturer.capture, module.layer_id)
             num_bound += 1
             continue
         if not isinstance(module, MoERunner):
             continue
         layer_id = module.layer_id
+        if layout is not None:
+            # The use counter must execute at MoE launch time, i.e. inside the
+            # opaque custom op. A traced (non-opaque) entry would freeze the
+            # counter at trace time instead.
+            if compiled and not _moe_entry_is_opaque(module):
+                raise ValueError(
+                    "YOCO routed-experts capture under torch.compile needs the "
+                    "opaque vllm.moe_forward custom op; "
+                    f"{module.layer_name} uses {module._forward_entry!r}."
+                )
+            bound_layers.append(layer_id)
 
         def capture_fn(
             topk_ids: torch.Tensor,
@@ -302,6 +529,17 @@ def bind_routed_experts_capturer(
 
     if num_bound == 0:
         raise ValueError("No supported MoE router found for routed-experts capture.")
+    if layout is not None:
+        expected = [
+            layer
+            for layer in range(layout.num_layers)
+            if layout.calls_per_forward(layer) > 0
+        ]
+        if sorted(bound_layers) != expected:
+            raise ValueError(
+                "YOCO routed-experts capture bound MoE layers "
+                f"{sorted(bound_layers)}, expected {expected}."
+            )
 
 
 def get_routed_experts_attn_gid(kv_cache_config: KVCacheConfig) -> int:
@@ -368,6 +606,16 @@ class RoutedExpertsManager:
             ),
             dtype=expert_id_dtype,
         )
+        # Per-(slot, use) presence; only for the logical-use layout (YOCO).
+        # A use is present iff the capturer wrote it in the step that
+        # computed the slot. Absent rows are stored as expert 0 in
+        # ``routed_experts_by_slot`` and must not be replayed.
+        self.use_layout = get_routed_experts_use_layout(vllm_config)
+        self.present_by_slot: np.ndarray | None = (
+            np.zeros((max_num_slots, num_layers), dtype=np.bool_)
+            if self.use_layout is not None
+            else None
+        )
         logger.info(
             "RoutedExpertsManager CPU buffer: %.2f GB "
             "(slots=%d, layers=%d, top_k=%d, dtype=%s)",
@@ -385,7 +633,54 @@ class RoutedExpertsManager:
         indexing handles repeated / out-of-order indices. Called once
         per scheduler step in ``update_from_output``.
         """
-        self.routed_experts_by_slot[slot_mapping] = data
+        if self.present_by_slot is None:
+            self.routed_experts_by_slot[slot_mapping] = data
+            return
+        present = self.present_rows(data)
+        self.routed_experts_by_slot[slot_mapping] = np.where(
+            present[..., None], data, 0
+        )
+        self.present_by_slot[slot_mapping] = present
+
+    @staticmethod
+    def present_rows(data: np.ndarray) -> np.ndarray:
+        """``(tokens, uses)`` presence of raw (signed, pre-narrowing) capture
+        data: a use is present iff all its top-k ids are >= 0 (the capturer
+        writes all k at once; -1 is the not-captured sentinel)."""
+        if not np.issubdtype(data.dtype, np.signedinteger):
+            raise TypeError(
+                f"presence needs the signed capture dtype, got {data.dtype}"
+            )
+        valid = data >= 0
+        present = valid.all(axis=-1)
+        if (valid.any(axis=-1) & ~present).any():
+            raise AssertionError("routed-experts row is partially captured")
+        return present
+
+    def get_present(
+        self,
+        block_ids: list[int],
+        num_tokens: int,
+        token_start: int = 0,
+    ) -> np.ndarray | None:
+        """``(num_tokens - token_start, num_uses)`` presence; ``None`` for the
+        per-layer layout. Same slot arithmetic as :meth:`get`."""
+        if self.present_by_slot is None:
+            return None
+        return self.present_by_slot[
+            self._slot_mapping(block_ids, num_tokens, token_start)
+        ]
+
+    def _slot_mapping(
+        self, block_ids: list[int], num_tokens: int, token_start: int
+    ) -> np.ndarray:
+        bs = self.block_size
+        block_ids_array = np.array(block_ids, dtype=np.int32)
+        block_offsets = np.arange(bs)
+        slot_mapping = (
+            block_ids_array.reshape(-1, 1) * bs + block_offsets.reshape(1, -1)
+        ).flatten()[:num_tokens]
+        return slot_mapping[token_start:]
 
     def get(
         self,

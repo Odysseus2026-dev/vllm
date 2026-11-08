@@ -577,6 +577,12 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     else None
                 )
 
+                routed_experts_present_b64 = (
+                    numpy2base64(output.routed_experts_present)
+                    if output.routed_experts_present is not None
+                    else None
+                )
+
                 choice_data = CompletionResponseChoice(
                     index=len(choices),
                     text=output_text,
@@ -591,6 +597,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
                     routed_experts=routed_experts_b64,
+                    routed_experts_present=routed_experts_present_b64,
                 )
                 choices.append(choice_data)
 

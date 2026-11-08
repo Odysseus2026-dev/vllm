@@ -66,6 +66,9 @@ class CompletionOutput:
     lora_request: LoRARequest | None = None
     sampling_mask: SamplingMask | None = None
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
+    # [seq_len, num_uses] bool, row-aligned with ``routed_experts``; set only
+    # for the YOCO logical-use layout. False = use not captured (don't replay).
+    routed_experts_present: np.ndarray | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -194,6 +197,13 @@ class RequestOutput:
                         )
                         completion.finish_reason = next_completion.finish_reason
                         completion.stop_reason = next_completion.stop_reason
+                        if next_completion.routed_experts is not None:
+                            # Routing arrives once, as a complete snapshot on
+                            # the final output; keep it when deltas coalesce.
+                            completion.routed_experts = next_completion.routed_experts
+                            completion.routed_experts_present = (
+                                next_completion.routed_experts_present
+                            )
                     else:
                         # Replace the output with the new one
                         self.outputs[i] = next_completion

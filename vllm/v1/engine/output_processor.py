@@ -189,6 +189,7 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
+        self.routed_experts_present_chunks: list[np.ndarray] = []
         self.sampling_mask_chunks: list[SamplingMaskLists] = []
 
         # Stream Interval
@@ -434,14 +435,26 @@ class RequestState:
 
         # Concatenate routed experts on finish
         routed_experts = None
+        routed_experts_present = None
         if finished and self.routed_experts_chunks:
             routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)
+            if self.routed_experts_present_chunks:
+                routed_experts_present = np.concatenate(
+                    self.routed_experts_present_chunks, axis=0
+                )
+                if routed_experts_present.shape != routed_experts.shape[:2]:
+                    raise AssertionError(
+                        "routed_experts_present shape "
+                        f"{routed_experts_present.shape} does not match "
+                        f"routed_experts {routed_experts.shape}"
+                    )
 
         return CompletionOutput(
             index=self.request_index,
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
+            routed_experts_present=routed_experts_present,
             sampling_mask=sampling_mask,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
@@ -680,6 +693,10 @@ class OutputProcessor:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
                 )
+                if engine_core_output.routed_experts_present is not None:
+                    req_state.routed_experts_present_chunks.append(
+                        engine_core_output.routed_experts_present
+                    )
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:
