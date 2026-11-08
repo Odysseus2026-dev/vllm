@@ -446,6 +446,12 @@ def _check_use_layout_supported(vllm_config: VllmConfig) -> None:
         raise ValueError(
             "YOCO routed-experts capture does not support dual-batch overlap."
         )
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        # Drafters (e.g. YOCO Shared-KV / dspark) may run extra forwards or
+        # share target modules; per-use counting is unverified there.
+        raise ValueError(
+            "YOCO routed-experts capture does not support speculative decoding."
+        )
 
 
 def _moe_entry_is_opaque(module) -> bool:
@@ -626,7 +632,12 @@ class RoutedExpertsManager:
             self.routed_experts_by_slot.dtype.name,
         )
 
-    def store_batch(self, data: np.ndarray, slot_mapping: np.ndarray) -> None:
+    def store_batch(
+        self,
+        data: np.ndarray,
+        slot_mapping: np.ndarray,
+        present: np.ndarray | None = None,
+    ) -> None:
         """Persist one step's routed experts into the slot buffer.
 
         Equivalent to ``slot_buffer[slot_mapping] = data``; numpy fancy
@@ -636,10 +647,11 @@ class RoutedExpertsManager:
         if self.present_by_slot is None:
             self.routed_experts_by_slot[slot_mapping] = data
             return
-        present = self.present_rows(data)
-        self.routed_experts_by_slot[slot_mapping] = np.where(
-            present[..., None], data, 0
-        )
+        if present is None:
+            present = self.present_rows(data)
+        if not present.all():
+            data = np.where(present[..., None], data, 0)
+        self.routed_experts_by_slot[slot_mapping] = data
         self.present_by_slot[slot_mapping] = present
 
     @staticmethod

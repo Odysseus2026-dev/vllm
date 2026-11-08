@@ -541,16 +541,22 @@ def test_yoco_use_layout_only_for_yoco():
     assert get_routed_experts_use_layout(vllm_config) is None
 
 
-def test_yoco_capture_refuses_fast_prefill_and_dbo():
+def test_yoco_capture_refuses_fast_prefill_dbo_and_spec_decode():
     cfg = SimpleNamespace(
         cache_config=SimpleNamespace(kv_sharing_fast_prefill=True),
         parallel_config=SimpleNamespace(enable_dbo=False),
+        speculative_config=None,
     )
     with pytest.raises(ValueError, match="kv_sharing_fast_prefill"):
         _check_use_layout_supported(cfg)
     cfg.cache_config.kv_sharing_fast_prefill = False
     cfg.parallel_config.enable_dbo = True
     with pytest.raises(ValueError, match="dual-batch"):
+        _check_use_layout_supported(cfg)
+    cfg.parallel_config.enable_dbo = False
+    _check_use_layout_supported(cfg)
+    cfg.speculative_config = SimpleNamespace(method="dspark")
+    with pytest.raises(ValueError, match="speculative decoding"):
         _check_use_layout_supported(cfg)
 
 
@@ -667,6 +673,10 @@ def test_yoco_manager_stores_present_mask_and_zeroes_absent_rows():
     expected = data.copy()
     expected[1, 4] = 0
     assert np.array_equal(routes, expected)
+    m2 = _yoco_manager(layout)
+    m2.store_batch(data, np.array([5, 6, 7]), m.present_rows(data))
+    assert np.array_equal(m2.routed_experts_by_slot, m.routed_experts_by_slot)
+    assert np.array_equal(m2.present_by_slot, m.present_by_slot)
     with pytest.raises(AssertionError, match="partially"):
         bad = data.copy()
         bad[0, 0, 0] = -1

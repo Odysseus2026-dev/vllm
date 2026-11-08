@@ -1980,10 +1980,14 @@ class Scheduler(SchedulerInterface):
         routing_offsets: dict[str, int] = {}
         if model_runner_output.routed_experts is not None:
             re = model_runner_output.routed_experts
-            self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
             if self.routed_experts_mgr.present_by_slot is not None:
                 # Before narrowing: -1 is the "not captured" sentinel.
                 routing_present = self.routed_experts_mgr.present_rows(re.routing_data)
+                self.routed_experts_mgr.store_batch(
+                    re.routing_data, re.slot_mapping, routing_present
+                )
+            else:
+                self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
             routing_data = re.routing_data.astype(
                 self.routed_experts_mgr.routed_experts_by_slot.dtype,
                 copy=False,
@@ -2184,11 +2188,12 @@ class Scheduler(SchedulerInterface):
                     routed_experts = routing_data[rows]
                     if routing_present is not None:
                         routed_experts_present = routing_present[rows]
-                        # Absent rows hold the -1 sentinel; report them as 0
-                        # like the slot buffer does.
-                        routed_experts = np.where(
-                            routed_experts_present[..., None], routed_experts, 0
-                        ).astype(routing_data.dtype, copy=False)
+                        if not routed_experts_present.all():
+                            # Absent rows hold the -1 sentinel; report them
+                            # as 0 like the slot buffer does.
+                            routed_experts = np.where(
+                                routed_experts_present[..., None], routed_experts, 0
+                            ).astype(routing_data.dtype, copy=False)
 
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
